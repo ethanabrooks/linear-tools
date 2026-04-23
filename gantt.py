@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Generate a Mermaid Gantt chart from Linear issues in the Search project.
 
+Only shows key deliverables matching the spreadsheet plan.
+
 Usage:
-    source ~/notion-linear-sync/.envrc
-    python3 /tmp/linear-gantt.py
+    source ~/linear-tools/.envrc
+    python3 ~/linear-tools/gantt.py
 """
 
 from __future__ import annotations
@@ -17,10 +19,45 @@ import httpx
 from pydantic import BaseModel
 
 LINEAR_API_KEY = os.environ["LINEAR_API_KEY"]
+SEARCH_PROJECT_ID = "716e79c1-1a55-42d5-ba55-5bf0e419a338"
+
+# Issues to show, grouped by track (row in the spreadsheet).
+# Order within each track determines display order.
+TRACKS: dict[str, list[str]] = {
+    "Xianjun pipeline": [
+        "SKILL-867",  # Cleanup non-wiki pipeline
+        "SKILL-864",  # Grader update (Handshake)
+        "SKILL-865",  # v2 e2e
+        "SKILL-870",  # v3 e2e
+        "SKILL-871",  # v4 e2e
+    ],
+    "Infra": [
+        "SKILL-842",  # Grader updates (enforce short answer)
+        "SKILL-762",  # Batch -> Ray
+        "SKILL-861",  # RayReducer
+    ],
+    "Ethan pipeline": [
+        "SKILL-860",  # Onboard graders to batch runner
+        "SKILL-862",  # Non-wiki datasource
+        "SKILL-851",  # 2nd provider routing
+        "SKILL-850",  # Circuit breakers
+    ],
+    "Docs and planning": [
+        "SKILL-846",  # Open questions doc
+        "SKILL-645",  # v1 e2e
+    ],
+    "Scale-up": [
+        "SKILL-841",  # Derisk rehearsal run
+    ],
+}
+
+ALL_IDS = [i for track in TRACKS.values() for i in track]
 
 _MILESTONES_QUERY = """
-query($name: String!) {
-  project(id: $name) { name projectMilestones { nodes { id name targetDate } } }
+query($pid: String!) {
+  project(id: $pid) {
+    projectMilestones { nodes { name targetDate } }
+  }
 }
 """
 
@@ -39,33 +76,20 @@ query($cursor: String) {
       identifier
       title
       dueDate
-      state { name type }
+      state { type }
       assignee { name }
-      parent { identifier }
-      projectMilestone { name }
     }
     pageInfo { hasNextPage endCursor }
   }
 }
 """
 
-SEARCH_PROJECT_ID = "716e79c1-1a55-42d5-ba55-5bf0e419a338"
-
 
 class State(BaseModel):
-    name: str
     type: str
 
 
 class Assignee(BaseModel):
-    name: str
-
-
-class Parent(BaseModel):
-    identifier: str
-
-
-class MilestoneRef(BaseModel):
     name: str
 
 
@@ -75,12 +99,9 @@ class Issue(BaseModel):
     dueDate: str | None = None
     state: State
     assignee: Assignee | None = None
-    parent: Parent | None = None
-    projectMilestone: MilestoneRef | None = None
 
 
-class ProjectMilestone(BaseModel):
-    id: str
+class Milestone(BaseModel):
     name: str
     targetDate: str | None = None
 
@@ -101,23 +122,23 @@ def _post(query: str, variables: dict | None = None) -> dict:
         return resp.json()["data"]
 
 
-def fetch_data() -> tuple[list[Issue], list[ProjectMilestone]]:
-    project_data = _post(
-        _MILESTONES_QUERY, dict(name=SEARCH_PROJECT_ID)
-    )
+def fetch_data() -> tuple[dict[str, Issue], list[Milestone]]:
+    project_data = _post(_MILESTONES_QUERY, dict(pid=SEARCH_PROJECT_ID))
     milestones = [
-        ProjectMilestone.model_validate(m)
+        Milestone.model_validate(m)
         for m in project_data["project"]["projectMilestones"]["nodes"]
     ]
 
-    issues: list[Issue] = []
+    issues: dict[str, Issue] = {}
     cursor: str | None = None
     while True:
         variables = dict(cursor=cursor) if cursor else {}
         data = _post(_ISSUES_QUERY, variables)
         page_info = PageInfo.model_validate(data["issues"]["pageInfo"])
         for node in data["issues"]["nodes"]:
-            issues.append(Issue.model_validate(node))
+            issue = Issue.model_validate(node)
+            if issue.identifier in ALL_IDS:
+                issues[issue.identifier] = issue
         if not page_info.hasNextPage:
             break
         cursor = page_info.endCursor
@@ -128,19 +149,18 @@ def fetch_data() -> tuple[list[Issue], list[ProjectMilestone]]:
 def sanitize(text: str) -> str:
     text = re.sub(r"[:\[\]#;`/→()\"']", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > 55:
-        text = text[:52] + "..."
+    if len(text) > 50:
+        text = text[:47] + "..."
     return text
 
 
-def assignee_tag(issue: Issue) -> str:
+def assignee_short(issue: Issue) -> str:
     if not issue.assignee:
         return ""
-    name = issue.assignee.name.split("@")[0].split()[0].capitalize()
-    return f" - {name}"
+    return issue.assignee.name.split("@")[0].split()[0].capitalize()
 
 
-def generate_gantt(issues: list[Issue], milestones: list[ProjectMilestone]) -> str:
+def generate_gantt(issues: dict[str, Issue], milestones: list[Milestone]) -> str:
     today = date.today()
     lines = [
         "gantt",
@@ -160,62 +180,43 @@ def generate_gantt(issues: list[Issue], milestones: list[ProjectMilestone]) -> s
             lines.append(f"    {sanitize(m.name)} :milestone, {m.targetDate}, 0d")
         lines.append("")
 
-    issues_with_dates = [
-        i for i in issues
-        if i.dueDate and date.fromisoformat(i.dueDate) >= today
-    ]
-    top_level = [i for i in issues_with_dates if i.parent is None]
-    children_by_parent: dict[str, list[Issue]] = {}
-    for i in issues_with_dates:
-        if i.parent:
-            children_by_parent.setdefault(i.parent.identifier, []).append(i)
-
-    parents_with_children = {
-        i.identifier for i in top_level if i.identifier in children_by_parent
-    }
-
-    standalone: dict[str, list[Issue]] = {}
-    for i in top_level:
-        if i.identifier in parents_with_children:
+    for track_name, issue_ids in TRACKS.items():
+        track_issues = [issues[i] for i in issue_ids if i in issues]
+        if not track_issues:
             continue
-        section = i.projectMilestone.name if i.projectMilestone else "Other"
-        standalone.setdefault(section, []).append(i)
 
-    for section in sorted(standalone):
-        lines.append(f"    section {sanitize(section)}")
-        for i in sorted(standalone[section], key=lambda x: x.dueDate or ""):
-            _render(lines, i, today)
-        lines.append("")
+        lines.append(f"    section {track_name}")
+        prev_due: date | None = None
+        for issue in track_issues:
+            due = date.fromisoformat(issue.dueDate) if issue.dueDate else None
+            if not due:
+                continue
 
-    for p in sorted(
-        [i for i in top_level if i.identifier in parents_with_children],
-        key=lambda x: x.dueDate or "",
-    ):
-        lines.append(f"    section {sanitize(p.title)}")
-        for child in sorted(children_by_parent[p.identifier], key=lambda x: x.dueDate or ""):
-            _render(lines, child, today)
+            name = sanitize(issue.title)
+            who = assignee_short(issue)
+            if who:
+                name += f" - {who}"
+
+            task_id = issue.identifier.replace("-", "_")
+
+            if issue.state.type == "started":
+                start = today
+                status = "active,"
+            elif prev_due and prev_due > today:
+                start = prev_due
+                status = ""
+            else:
+                start = max(today, due - timedelta(days=5))
+                status = ""
+
+            if start >= due:
+                start = due - timedelta(days=1)
+
+            lines.append(f"    {name} :{status} {task_id}, {start}, {due}")
+            prev_due = due
         lines.append("")
 
     return "\n".join(lines)
-
-
-def _render(lines: list[str], issue: Issue, today: date) -> None:
-    due = date.fromisoformat(issue.dueDate) if issue.dueDate else None
-    if not due or due < today:
-        return
-
-    name = sanitize(issue.title) + assignee_tag(issue)
-    task_id = issue.identifier.replace("-", "_")
-
-    match issue.state.type:
-        case "started":
-            start = today
-            status = "active,"
-        case _:
-            start = max(today, due - timedelta(days=7))
-            status = ""
-
-    lines.append(f"    {name} :{status} {task_id}, {start}, {due}")
 
 
 def main() -> None:
